@@ -54,10 +54,11 @@ class ResnetBlock(nn.Module):
 
 class ResnetGenerator(nn.Module):
     """
-    ResNet-based generator from CycleGAN (Johnson et al. style).
+    Enhanced ResNet-based generator with configurable blocks and features.
+    Uses instance normalization, reflect padding, and no dropout for quality.
     """
 
-    def __init__(self, input_nc: int = 1, output_nc: int = 1, ngf: int = 64, n_blocks: int = 6):
+    def __init__(self, input_nc: int = 1, output_nc: int = 1, ngf: int = 64, n_blocks: int = 9):
         super().__init__()
         assert n_blocks >= 0
         model = [
@@ -99,7 +100,8 @@ class ResnetGenerator(nn.Module):
 
 class NLayerDiscriminator(nn.Module):
     """
-    PatchGAN discriminator from CycleGAN/Pix2Pix.
+    Enhanced PatchGAN discriminator with 70x70 receptive field.
+    Uses instance normalization for stable training.
     """
 
     def __init__(self, input_nc: int = 1, ndf: int = 64, n_layers: int = 3):
