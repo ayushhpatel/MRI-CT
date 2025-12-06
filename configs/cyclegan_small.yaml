@@ -1,0 +1,20 @@
+data:
+  mri_dir: "data/chaos_small/mri"
+  ct_dir: "data/chaos_small/ct"
+  num_workers: 2
+
+model:
+  n_res_blocks: 3     # Faster
+
+train:
+  epochs: 5           # ~8-12 min on RTX 4070
+  batch_size: 1
+  lr: 0.0002
+  lambda_cycle: 10
+  lambda_identity: 5
+  lsgan: true
+  force_cpu: false
+  log_every: 40
+  sample_every: 120
+  save_every_steps: 400
+  save_dir: "runs/chaos_small"

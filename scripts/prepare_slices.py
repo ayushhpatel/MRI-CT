@@ -1,36 +1,49 @@
-"""
-Convert downloaded MRI/CT volumes into 2D PNG slices for CycleGAN training.
-Usage:
-    python scripts/prepare_slices.py --raw data/raw --out data/processed --size 256 --max-slices 80
+"""Prepare 2D PNG slices from CHAOS dataset volumes (NIfTI / DICOM).
+
+Functionality:
+- Input: data/raw/chaos/** (configurable)
+- Output: data/chaos/mri_slices and data/chaos/ct_slices
+- Modality detection by filename/folder (T1/T2/MR -> MRI, CT -> CT)
+- NIfTI via nibabel, DICOM via pydicom (series stacking)
+- Percentile clipping (1-99%), scaled to 0-255
+- Skip slices with std < threshold
+- Up to configurable max slices per scan
+- Produces manifest.json at data/chaos/manifest.json
 """
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import nibabel as nib
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-MRI_KEYWORDS = ("ixi", "t1", "t2", "prostate")
-CT_KEYWORDS = ("ct", "spleen", "copd")
+import importlib
+import subprocess
+import sys
+
+import pydicom   # force import, fail if missing
+
+MRI_KEYWORDS = ("t1", "t2", "mr")
+CT_KEYWORDS = ("ct",)
 
 
-def classify_modality(path: Path) -> str:
+def detect_modality(path: Path) -> Optional[str]:
+    s = "/".join(path.parts).lower()
     name = path.name.lower()
-    if any(k in name for k in MRI_KEYWORDS):
+    if any(k in s or k in name for k in MRI_KEYWORDS):
         return "mri"
-    if any(k in name for k in CT_KEYWORDS):
+    if any(k in s or k in name for k in CT_KEYWORDS):
         return "ct"
-    raise ValueError(f"Could not classify modality for {path}")
+    return None
 
 
 def normalize_slice(slice_arr: np.ndarray) -> np.ndarray:
-    # percentile clipping to limit outliers, then min-max to 0-255
-    low, high = np.percentile(slice_arr, (1, 99))
+    low, high = np.percentile(slice_arr, (1.0, 99.0))
     clipped = np.clip(slice_arr, low, high)
     clipped = clipped - clipped.min()
     denom = clipped.max() if clipped.max() > 0 else 1.0
@@ -38,103 +51,166 @@ def normalize_slice(slice_arr: np.ndarray) -> np.ndarray:
     return scaled.astype(np.uint8)
 
 
-def load_volume(path: Path) -> np.ndarray:
+def load_nifti(path: Path) -> np.ndarray:
     img = nib.load(str(path))
     data = img.get_fdata()
-    if data.ndim == 4:  # drop channels if present
+    if data.ndim == 4:
         data = data[..., 0]
     return np.asarray(data, dtype=np.float32)
+
+
+def load_dicom_series(series_path: Path) -> np.ndarray:
+    files = sorted(series_path.glob("*.dcm"))
+    if not files:
+        # maybe single .dcm file passed
+        if series_path.suffix.lower() == ".dcm":
+            files = [series_path]
+        else:
+            raise RuntimeError(f"No DICOM files found in {series_path}")
+    slices = []
+    meta = []
+    for f in files:
+        ds = pydicom.dcmread(str(f))
+        arr = ds.pixel_array.astype(np.float32)
+        slices.append(arr)
+        meta.append(getattr(ds, "InstanceNumber", None))
+    # sort by InstanceNumber if present
+    if any(m is not None for m in meta):
+        paired = sorted(zip(meta, slices), key=lambda x: (x[0] if x[0] is not None else 0))
+        slices = [p[1] for p in paired]
+    vol = np.stack(slices, axis=-1)
+    return vol
+
+
+def load_volume(path: Path) -> np.ndarray:
+    if path.suffix.lower() in (".nii", ".gz") or path.name.lower().endswith(".nii.gz"):
+        return load_nifti(path)
+    if path.suffix.lower() == ".dcm":
+        if pydicom is None:
+            raise RuntimeError("pydicom is required to read DICOM files")
+        return load_dicom_series(path)
+    if path.is_dir():
+        # Directory of DICOM files
+        if pydicom is None:
+            raise RuntimeError("pydicom is required to read DICOM directories")
+        return load_dicom_series(path)
+    # fallback try nifti
+    return load_nifti(path)
 
 
 def slice_volume(
     vol: np.ndarray,
     modality: str,
-    source: Path,
+    subject: str,
     out_dir: Path,
     target_size: int,
     min_std: float,
-    max_slices: int | None,
+    max_slices: Optional[int],
 ) -> List[Dict]:
-    out_records: List[Dict] = []
     out_dir.mkdir(parents=True, exist_ok=True)
-    axes = (2 if vol.shape[2] >= vol.shape[0] else 0)  # heuristically prefer axial
-    indices = list(range(vol.shape[axes]))
-    if max_slices:
+    # prefer last axis as slice axis if it's reasonably sized
+    if vol.ndim == 3:
+        z = vol.shape[2]
+        axes = 2
+    elif vol.ndim == 2:
+        # single slice
+        vol = vol[:, :, np.newaxis]
+        z = 1
+        axes = 2
+    else:
+        # try to find an axis with size > 1
+        z = vol.shape[-1]
+        axes = vol.ndim - 1
+
+    indices = list(range(z))
+    if max_slices and len(indices) > max_slices:
         step = max(1, len(indices) // max_slices)
         indices = indices[::step][:max_slices]
 
-    for idx in indices:
-        if axes == 2:
-            slc = vol[:, :, idx]
-        elif axes == 0:
-            slc = vol[idx, :, :]
-        else:
-            slc = vol[:, idx, :]
+    records: List[Dict] = []
+    for i in indices:
+        slc = vol[:, :, i]
         if np.std(slc) < min_std:
             continue
         norm = normalize_slice(slc)
-        img = Image.fromarray(norm)
-        img = img.convert("L")
+        img = Image.fromarray(norm).convert("L")
         img = img.resize((target_size, target_size), Image.BILINEAR)
-        fname = f"{source.stem}_z{idx:03d}.png"
+        fname = f"chaos_{modality}_{subject}_slice_{i:03d}.png"
         out_path = out_dir / fname
         img.save(out_path)
-        out_records.append(
-            {
-                "path": str(out_path),
-                "source": str(source),
-                "slice_index": int(idx),
-                "modality": modality,
-                "mean": float(np.mean(norm)),
-                "std": float(np.std(norm)),
-            }
-        )
-    return out_records
+        records.append({
+            "path": str(out_path),
+            "subject": subject,
+            "slice": int(i),
+        })
+    return records
 
 
-def collect_volumes(raw_dir: Path) -> List[Path]:
-    patterns = ("*.nii", "*.nii.gz")
-    files: List[Path] = []
+def collect_inputs(raw_root: Path) -> List[Path]:
+    patterns = ("*.nii", "*.nii.gz", "*.dcm")
+    found: List[Path] = []
     for pat in patterns:
-        files.extend(raw_dir.rglob(pat))
-    return sorted(files)
+        found.extend(raw_root.rglob(pat))
+    # For DICOM directories, include folders that contain .dcm files
+    for d in raw_root.rglob("*"):
+        if d.is_dir() and any(d.glob("*.dcm")):
+            found.append(d)
+    # make unique and sort
+    uniq = sorted(set(found), key=lambda p: str(p))
+    return uniq
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare 2D slices from MRI/CT volumes.")
-    parser.add_argument("--raw", type=Path, default=Path("data/raw"))
-    parser.add_argument("--out", type=Path, default=Path("data/processed"))
-    parser.add_argument("--size", type=int, default=256, help="Output square image size.")
-    parser.add_argument("--min-std", type=float, default=5.0, help="Discard slices with low variation.")
-    parser.add_argument("--max-slices", type=int, default=80, help="Limit slices per volume (per axis).")
+    parser = argparse.ArgumentParser(description="Prepare CHAOS slices")
+    parser.add_argument("--raw", type=Path, default=Path("data/raw/chaos"))
+    parser.add_argument("--mri_out", type=Path, default=Path("data/chaos/mri_slices"))
+    parser.add_argument("--ct_out", type=Path, default=Path("data/chaos/ct_slices"))
+    parser.add_argument("--size", type=int, default=256)
+    parser.add_argument("--min-std", type=float, default=5.0)
+    parser.add_argument("--max-slices", type=int, default=120)
     args = parser.parse_args()
 
-    volumes = collect_volumes(args.raw)
-    if not volumes:
-        raise SystemExit(f"No NIfTI files found in {args.raw}")
+    inputs = collect_inputs(args.raw)
+    if not inputs:
+        raise SystemExit(f"No volumes found under {args.raw}")
 
     manifest: Dict[str, List[Dict]] = {"mri": [], "ct": []}
-    for vol_path in tqdm(volumes, desc="Volumes"):
-        modality = classify_modality(vol_path)
-        out_subdir = args.out / modality
-        vol = load_volume(vol_path)
+    for p in tqdm(inputs, desc="Processing volumes"):
+        modality = detect_modality(p)
+        if modality is None:
+            # try to infer from parent folder
+            modality = detect_modality(p.parent) or "mri"
+        subject = p.stem if p.is_file() else p.name
+        if modality == "mri":
+            out_dir = args.mri_out
+        else:
+            out_dir = args.ct_out
+        try:
+            vol = load_volume(p)
+        except Exception as e:
+            print(f"Skipping {p}: could not load volume ({e})")
+            continue
         records = slice_volume(
             vol=vol,
             modality=modality,
-            source=vol_path,
-            out_dir=out_subdir,
+            subject=subject,
+            out_dir=out_dir,
             target_size=args.size,
             min_std=args.min_std,
             max_slices=args.max_slices,
         )
         manifest[modality].extend(records)
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    manifest_path = args.out / "manifest.json"
-    with manifest_path.open("w") as f:
-        json.dump(manifest, f, indent=2)
+    # ensure output folders exist
+    args.mri_out.mkdir(parents=True, exist_ok=True)
+    args.ct_out.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path("data/chaos/manifest.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w") as fh:
+        json.dump(manifest, fh, indent=2)
 
-    print(f"Saved manifest with {len(manifest['mri'])} MRI slices and {len(manifest['ct'])} CT slices to {manifest_path}")
+    print(f"Wrote manifest: {manifest_path}")
+    print(f"MRI slices: {len(manifest['mri'])}, CT slices: {len(manifest['ct'])}")
 
 
 if __name__ == "__main__":

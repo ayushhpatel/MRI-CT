@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 .DS_Store
 data/raw/
+data/chaos_small/
+data/chaos/
 data/processed/
-runs/
 *.pth
 *.pt

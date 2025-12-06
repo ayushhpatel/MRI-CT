@@ -59,13 +59,22 @@ def cycle_gan_step(
     real_mri = real_mri.to(device)
     real_ct = real_ct.to(device)
 
-    valid = torch.ones((real_mri.size(0), 1, 30, 30), device=device)
-    fake = torch.zeros_like(valid)
-
+    # Modified: Dynamic discriminator target tensor shapes instead of hard-coded (1,30,30)
     G_AB = models["G_AB"]
     G_BA = models["G_BA"]
     D_A = models["D_A"]
     D_B = models["D_B"]
+    
+    # Compute validity maps dynamically using discriminator output shapes
+    # create target labels using full batch prediction shape
+    pred_real_A = D_A(real_mri)
+    valid_A = torch.ones_like(pred_real_A)
+    fake_A  = torch.zeros_like(pred_real_A)
+
+    pred_real_B = D_B(real_ct)
+    valid_B = torch.ones_like(pred_real_B)
+    fake_B  = torch.zeros_like(pred_real_B)
+
 
     # ------------------
     #  Train Generators
@@ -79,14 +88,18 @@ def cycle_gan_step(
     loss_id_mri = criterions["L1"](id_mri, real_mri)
     loss_identity = (loss_id_ct + loss_id_mri) * lambdas["identity"]
 
-    # GAN loss
+    # GAN loss - Modified: Use valid_B/fake_B for CT loss and valid_A/fake_A for MRI loss
     fake_ct = G_AB(real_mri)
     pred_fake_ct = D_B(fake_ct)
-    loss_G_AB = criterions["GAN"](pred_fake_ct, valid)
+    valid_B = torch.ones_like(pred_fake_ct)  # match shape!
+    loss_G_AB = criterions["GAN"](pred_fake_ct, valid_B)
+
 
     fake_mri = G_BA(real_ct)
     pred_fake_mri = D_A(fake_mri)
-    loss_G_BA = criterions["GAN"](pred_fake_mri, valid)
+    valid_A = torch.ones_like(pred_fake_mri)
+    loss_G_BA = criterions["GAN"](pred_fake_mri, valid_A)
+
 
     # Cycle loss
     rec_mri = G_BA(fake_ct)
@@ -103,23 +116,43 @@ def cycle_gan_step(
     #  Train Discriminator A (MRI)
     # -----------------------
     optimizers["D_A"].zero_grad()
-    loss_real = criterions["GAN"](D_A(real_mri), valid)
-    fake_buffered = buffers["A"].push_and_pop(fake_mri.detach())
-    loss_fake = criterions["GAN"](D_A(fake_buffered), fake)
-    loss_D_A = 0.5 * (loss_real + loss_fake)
+
+    # Real MRI
+    pred_real_A = D_A(real_mri)
+    valid_A = torch.ones_like(pred_real_A)
+    loss_real_A = criterions["GAN"](pred_real_A, valid_A)
+
+    # Fake MRI from generator
+    fake_buffered_A = buffers["A"].push_and_pop(fake_mri.detach())  # replay buffer
+    pred_fake_A = D_A(fake_buffered_A)
+    fake_A = torch.zeros_like(pred_fake_A)
+    loss_fake_A = criterions["GAN"](pred_fake_A, fake_A)
+
+    loss_D_A = 0.5 * (loss_real_A + loss_fake_A)
     loss_D_A.backward()
     optimizers["D_A"].step()
+
 
     # -----------------------
     #  Train Discriminator B (CT)
     # -----------------------
     optimizers["D_B"].zero_grad()
-    loss_real = criterions["GAN"](D_B(real_ct), valid)
-    fake_buffered = buffers["B"].push_and_pop(fake_ct.detach())
-    loss_fake = criterions["GAN"](D_B(fake_buffered), fake)
-    loss_D_B = 0.5 * (loss_real + loss_fake)
+
+    # Real CT
+    pred_real_B = D_B(real_ct)
+    valid_B = torch.ones_like(pred_real_B)
+    loss_real_B = criterions["GAN"](pred_real_B, valid_B)
+
+    # Fake CT from generator
+    fake_buffered_B = buffers["B"].push_and_pop(fake_ct.detach())
+    pred_fake_B = D_B(fake_buffered_B)
+    fake_B = torch.zeros_like(pred_fake_B)
+    loss_fake_B = criterions["GAN"](pred_fake_B, fake_B)
+
+    loss_D_B = 0.5 * (loss_real_B + loss_fake_B)
     loss_D_B.backward()
     optimizers["D_B"].step()
+
 
     return {
         "loss_G": loss_G.item(),
@@ -137,12 +170,14 @@ def load_config(path: Path) -> Dict:
 
 
 def build_dataloader(cfg: Dict) -> DataLoader:
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,)),
-        ]
-    )
+    # Modified: Added basic image augmentations
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
     dataset = UnpairedImageDataset(
         mri_dir=Path(cfg["data"]["mri_dir"]),
         ct_dir=Path(cfg["data"]["ct_dir"]),
@@ -201,7 +236,8 @@ def load_checkpoint(
 
 def train(cfg_path: Path) -> None:
     cfg = load_config(cfg_path)
-    device = get_device(force_cpu=cfg["train"].get("force_cpu", True))
+    # Modified: Enable GPU training safely - do not force CPU by default
+    device = get_device(force_cpu=cfg["train"].get("force_cpu", False))
 
     dataloader = build_dataloader(cfg)
 

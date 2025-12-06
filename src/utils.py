@@ -8,6 +8,7 @@ from torchvision.utils import save_image, make_grid
 
 
 def get_device(force_cpu: bool = False) -> torch.device:
+    # Modified: Return CUDA if available unless forced to use CPU
     if not force_cpu and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")

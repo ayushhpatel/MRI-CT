@@ -1,0 +1,20 @@
+data:
+  mri_dir: "data/chaos/mri_slices"
+  ct_dir: "data/chaos/ct_slices"
+  num_workers: 4
+
+model:
+  n_res_blocks: 6
+
+train:
+  epochs: 40
+  batch_size: 4
+  lr: 0.0002
+  lambda_cycle: 10.0
+  lambda_identity: 5.0
+  lsgan: true
+  force_cpu: false
+  log_every: 50
+  sample_every: 200
+  save_every_steps: 500
+  save_dir: "runs/chaos_train"
