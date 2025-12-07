@@ -28,15 +28,15 @@ if __name__ == "__main__":
     CT_SRC  = "data/chaos/ct_slices"
 
     # New reduced dataset folders
-    MRI_OUT = "data/chaos_small/mri"
-    CT_OUT  = "data/chaos_small/ct"
+    MRI_OUT = "data/chaos_3k/mri"
+    CT_OUT  = "data/chaos_3k/ct"
 
-    # samples per class
-    N = 1500  # change to 1200, 2000, etc. if needed
+    # samples per class  
+    N = 2500  # Max available for MRI is 2588, using 2500 for safety
 
     copy_subset(MRI_SRC, MRI_OUT, N)
     copy_subset(CT_SRC, CT_OUT, N)
 
-    print("\n🎉 Small dataset created successfully!")
-    print("Path: data/chaos_small/")
-    print("Use this in config for fast training.")
+    print("\n🎉 Larger dataset (2.5K samples) created successfully!")
+    print("Path: data/chaos_3k/")
+    print("Use this in config for more comprehensive training.")

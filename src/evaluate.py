@@ -9,9 +9,13 @@ import argparse
 import csv
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 from datetime import datetime
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn.functional as F
@@ -26,8 +30,8 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import mean_squared_error as mse
 
-from models import ResnetGenerator
-from datasets import list_images
+from src.models import ResnetGenerator
+from src.datasets import list_images
 
 # Set plotting style
 plt.style.use('default')
@@ -621,14 +625,14 @@ def print_enhanced_summary(df: pd.DataFrame, checkpoint_name: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Comprehensive CycleGAN Evaluation Pipeline")
     parser.add_argument("--checkpoint", type=Path, 
-                       default=Path("../runs/hd_fast/checkpoints/step_008000.pt"),
+                       default=Path("../runs/chaos_3k_enhanced/checkpoints/step_024000.pt"),
                        help="Path to trained CycleGAN checkpoint")
     parser.add_argument("--mri-dir", type=Path, default=Path("../data/chaos/mri_slices"),
                        help="Directory containing MRI images")
     parser.add_argument("--ct-dir", type=Path, default=Path("../data/chaos/ct_slices"), 
                        help="Directory containing CT images")
     parser.add_argument("--output-dir", type=Path, 
-                       default=Path(f"../final_hd_fast_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+                       default=Path(f"../final_chaos_3k_enhanced_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
                        help="Directory to save evaluation results")
     parser.add_argument("--n-samples", type=int, default=100,
                        help="Number of samples to evaluate per direction")
@@ -641,7 +645,7 @@ def main():
     
     # Find best checkpoint if default doesn't exist
     if not args.checkpoint.exists():
-        checkpoint_dir = Path("../runs/hd_fast/checkpoints")
+        checkpoint_dir = Path("../runs/chaos_3k_enhanced/checkpoints")
         if checkpoint_dir.exists():
             checkpoints = sorted(list(checkpoint_dir.glob("*.pt")))
             if checkpoints:
@@ -662,7 +666,7 @@ def main():
     if args.device:
         device = torch.device(args.device)
     
-    print("🚀 Starting Final CycleGAN Evaluation on HD_FAST Results")
+    print("🚀 Starting Final CycleGAN Evaluation on CHAOS_3K_ENHANCED Results")
     print("=" * 70)
     print(f"📂 Checkpoint: {args.checkpoint}")
     print(f"📊 Samples per direction: {args.n_samples}")

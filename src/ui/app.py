@@ -1,369 +1,502 @@
-"""
-Streamlit UI for MRI→CT CycleGAN Inference
-
-This application provides a web interface for running MRI to CT synthesis
-using a trained CycleGAN model. Users can upload MRI images and generate
-synthetic CT scans with cycle-consistency visualization.
-
-Features:
-- File upload (PNG, JPG, JPEG, NIfTI formats)
-- Real-time inference with trained CycleGAN model
-- Cycle consistency visualization (MRI → CT → MRI)
-- Results download and export
-"""
-
 import sys
 from pathlib import Path
-
-# Add project root to Python path for imports
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+import io
+import tempfile
+import glob
 
 import streamlit as st
 import torch
 from PIL import Image
 import numpy as np
-import io
-from typing import Optional, Tuple
-import time
+import nibabel as nib
 
-# Project imports
+# Add project root to Python path for imports
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import everything from utils.py - no preprocessing duplicates
 from src.utils import (
-    preprocess_image, 
-    load_nifti_slice, 
-    tensor_to_pil, 
-    run_cyclegan_inference,
-    save_inference_results,
-    get_device
+    preprocess_image,
+    postprocess_tensor, 
+    run_dual_mode_inference,
+    extract_nifti_slice_as_png
 )
 
 
 # Configuration
-CHECKPOINT_PATH = project_root / "runs" / "hd_fast" / "checkpoints" / "step_008000.pt"
-RESULTS_DIR = project_root / "inference_results"
-SUPPORTED_IMAGE_FORMATS = ['.png', '.jpg', '.jpeg']
-SUPPORTED_NIFTI_FORMATS = ['.nii', '.nii.gz']
-TARGET_SIZE = 256
+CHECKPOINT_PATH = PROJECT_ROOT / "runs" / "chaos_3k_enhanced" / "checkpoints" / "step_024000.pt"
+SUPPORTED_IMAGE_EXTS = [".png", ".jpg", ".jpeg"]
+SUPPORTED_NIFTI_EXTS = [".nii", ".nii.gz"]
 
 
-def setup_page():
+def _bytes_from_pil(pil_img: Image.Image, format: str = "PNG") -> bytes:
+    """Convert PIL image to bytes for download."""
+    buf = io.BytesIO()
+    pil_img.save(buf, format=format)
+    return buf.getvalue()
+
+
+def _resolve_checkpoint(default_path: Path) -> Path:
+    """Resolve checkpoint path, fallback to latest if default missing."""
+    if default_path.exists():
+        return default_path
+    
+    # Try to find latest checkpoint in directory
+    try:
+        ckpt_dir = default_path.parent
+        candidates = sorted(glob.glob(str(ckpt_dir / "*.pt")))
+        if candidates:
+            latest_path = Path(candidates[-1])
+            st.warning(f"Default checkpoint missing. Using latest: {latest_path.name}")
+            return latest_path
+    except Exception as e:
+        st.error(f"Checkpoint discovery failed: {e}")
+    
+    st.error(f"No checkpoints found in {default_path.parent}")
+    return default_path  # Return original for error handling
+
+
+def _create_volume_previews(volume: np.ndarray) -> tuple:
+    """Create axial, coronal, sagittal preview slices from 3D volume."""
+    H, W, D = volume.shape
+    z_mid, y_mid, x_mid = D // 2, H // 2, W // 2
+    
+    # Robust normalization to handle different NIfTI data ranges
+    def normalize_slice_robust(slice_data):
+        # Convert to float and handle NaN/inf values
+        slice_clean = np.nan_to_num(slice_data.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Get percentile-based normalization (more robust than min/max)
+        p2, p98 = np.percentile(slice_clean, [2, 98])
+        
+        if p98 - p2 < 1e-6:
+            # Handle constant slices
+            return np.zeros_like(slice_clean, dtype=np.uint8)
+        
+        # Clip and normalize to [0, 255]
+        normalized = np.clip((slice_clean - p2) / (p98 - p2), 0, 1)
+        return (normalized * 255).astype(np.uint8)
+    
+    # Extract and normalize middle slices
+    axial_slice = normalize_slice_robust(volume[:, :, z_mid])
+    coronal_slice = normalize_slice_robust(volume[:, y_mid, :])
+    sagittal_slice = normalize_slice_robust(volume[x_mid, :, :])
+    
+    # Convert to PIL images
+    axial_img = Image.fromarray(axial_slice, mode="L")
+    coronal_img = Image.fromarray(coronal_slice, mode="L")
+    sagittal_img = Image.fromarray(sagittal_slice, mode="L")
+    
+    return axial_img, coronal_img, sagittal_img, (z_mid, y_mid, x_mid)
+
+
+def _setup_page():
     """Configure Streamlit page settings."""
     st.set_page_config(
-        page_title="MRI→CT CycleGAN Inference",
-        page_icon="🧠",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        page_title="MRI→CT CycleGAN Inference", 
+        page_icon="🧠", 
+        layout="wide"
     )
-    
-    st.title("🧠 MRI→CT CycleGAN Inference")
+    st.title("🧠 MRI→CT CycleGAN Inference (2D + 3D)")
     st.markdown("""
-    **Generate synthetic CT scans from MRI images using trained CycleGAN**
+    **Unified dual-mode inference for medical image translation**
     
-    Upload an MRI image to generate a corresponding synthetic CT scan. 
-    The model also shows cycle consistency by reconstructing the original MRI.
+    📷 **2D Mode**: Upload PNG/JPG → Generate single CT slice  
+    🧠 **3D Mode**: Upload NIfTI → Generate full CT volume (slice-by-slice)
     """)
 
 
-def check_requirements() -> bool:
-    """Check if all requirements are met for inference."""
-    issues = []
-    
-    # Check checkpoint availability
-    if not CHECKPOINT_PATH.exists():
-        issues.append(f"❌ Checkpoint not found: {CHECKPOINT_PATH}")
-    
-    # Check device availability
-    device = get_device()
-    if device.type == 'cuda':
-        st.sidebar.success(f"✅ Using GPU: {torch.cuda.get_device_name()}")
-    else:
-        st.sidebar.info("ℹ️ Using CPU (slower inference)")
-    
-    if issues:
-        st.error("**Setup Issues:**")
-        for issue in issues:
-            st.error(issue)
-        return False
-    
-    st.sidebar.success("✅ All requirements met")
-    return True
-
-
-def process_uploaded_file(uploaded_file) -> Optional[Tuple[Image.Image, str, Optional[int]]]:
-    """
-    Process uploaded file and return PIL Image, file info, and slice index (if NIfTI).
-    
-    Returns:
-        Tuple of (PIL_Image, file_info_string, slice_index_if_nifti)
-    """
-    try:
-        file_extension = Path(uploaded_file.name).suffix.lower()
+def _render_sidebar(checkpoint_path: Path):
+    """Render sidebar with system information."""
+    with st.sidebar:
+        st.header("⚙️ System Status")
         
-        if file_extension in SUPPORTED_IMAGE_FORMATS:
-            # Handle regular image files
-            image = Image.open(uploaded_file)
-            file_info = f"**File:** {uploaded_file.name} ({image.size[0]}×{image.size[1]})"
-            return image, file_info, None
-            
-        elif any(uploaded_file.name.lower().endswith(ext) for ext in SUPPORTED_NIFTI_FORMATS):
-            # Handle NIfTI files
-            # Save uploaded file temporarily
-            temp_path = RESULTS_DIR / "temp_nifti.nii.gz"
-            temp_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.read())
-            
-            # Extract middle slice
-            slice_array, slice_idx = load_nifti_slice(temp_path)
-            image = Image.fromarray(slice_array, mode='L')
-            
-            # Cleanup temp file
-            temp_path.unlink()
-            
-            file_info = f"**File:** {uploaded_file.name} (NIfTI slice {slice_idx})"
-            return image, file_info, slice_idx
-            
+        # Checkpoint status
+        st.subheader("Checkpoint")
+        resolved_path = _resolve_checkpoint(checkpoint_path)
+        st.write(f"📁 {resolved_path.name}")
+        exists = resolved_path.exists()
+        if exists:
+            st.success("✅ Checkpoint loaded")
         else:
-            st.error(f"Unsupported file format: {file_extension}")
-            return None
+            st.error("❌ Checkpoint missing")
+            st.stop()
+        
+        # Device information
+        st.subheader("Device")
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        if device.type == "cuda":
+            st.success(f"🚀 GPU: {torch.cuda.get_device_name()}")
+        else:
+            st.info("💻 CPU (slower)")
+        
+        # Options
+        st.subheader("Options")
+        do_cycle = st.checkbox("Enable cycle reconstruction (2D only)", value=True)
+        
+        return resolved_path, do_cycle
+
+
+def _handle_2d_inference(pil_img: Image.Image, checkpoint_path: Path, do_cycle: bool):
+    """Handle 2D slice inference workflow."""
+    st.image(pil_img, caption=f"Input MRI ({pil_img.size[0]}×{pil_img.size[1]})", width=320)
+    
+    if st.button("🚀 Run 2D Inference", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Running MRI→CT inference..."):
+                result = run_dual_mode_inference(pil_img, checkpoint_path, do_cycle=do_cycle)
             
-    except Exception as e:
-        st.error(f"Error processing file: {str(e)}")
-        return None
-
-
-def display_inference_results(
-    input_mri: torch.Tensor, 
-    fake_ct: torch.Tensor, 
-    cycle_mri: torch.Tensor
-):
-    """Display inference results in a 3-column layout."""
-    
-    # Convert tensors to PIL Images for display
-    input_pil = tensor_to_pil(input_mri)
-    fake_ct_pil = tensor_to_pil(fake_ct)
-    cycle_mri_pil = tensor_to_pil(cycle_mri)
-    
-    st.markdown("### 🔬 Inference Results")
-    
-    # Three-column layout
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("**📱 Input MRI**")
-        st.image(input_pil, caption="Original MRI", use_column_width=True)
-        
-    with col2:
-        st.markdown("**🦴 Generated CT**")
-        st.image(fake_ct_pil, caption="Synthetic CT", use_column_width=True)
-        
-    with col3:
-        st.markdown("**🔄 Reconstructed MRI**")
-        st.image(cycle_mri_pil, caption="Cycle-back MRI", use_column_width=True)
-    
-    return input_pil, fake_ct_pil, cycle_mri_pil
-
-
-def create_download_section(input_pil: Image.Image, fake_ct_pil: Image.Image, cycle_mri_pil: Image.Image):
-    """Create download links for all generated images."""
-    
-    st.markdown("### 💾 Download Results")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    # Helper function to convert PIL to bytes
-    def pil_to_bytes(pil_image: Image.Image, format: str = 'PNG') -> bytes:
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format=format)
-        return buffer.getvalue()
-    
-    with col1:
-        input_bytes = pil_to_bytes(input_pil)
-        st.download_button(
-            label="📱 Download Input MRI",
-            data=input_bytes,
-            file_name="input_mri.png",
-            mime="image/png"
-        )
-    
-    with col2:
-        fake_ct_bytes = pil_to_bytes(fake_ct_pil)
-        st.download_button(
-            label="🦴 Download Synthetic CT", 
-            data=fake_ct_bytes,
-            file_name="fake_ct.png",
-            mime="image/png"
-        )
-    
-    with col3:
-        cycle_mri_bytes = pil_to_bytes(cycle_mri_pil)
-        st.download_button(
-            label="🔄 Download Reconstructed MRI",
-            data=cycle_mri_bytes,
-            file_name="cycle_mri.png", 
-            mime="image/png"
-        )
-
-
-def run_inference_pipeline(image: Image.Image) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """
-    Run the complete inference pipeline.
-    
-    Returns:
-        Tuple of (input_tensor, fake_ct_tensor, cycle_mri_tensor) or None if error
-    """
-    try:
-        # Preprocess image
-        with st.spinner("🔄 Preprocessing image..."):
-            input_tensor = preprocess_image(image, TARGET_SIZE)
-        
-        # Run inference
-        with st.spinner("🧠 Running CycleGAN inference..."):
-            start_time = time.time()
-            fake_ct, cycle_mri = run_cyclegan_inference(
-                input_tensor, 
-                CHECKPOINT_PATH,
-                device=get_device()
+            # Display results
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.image(pil_img, caption="Input MRI", width=200)
+            
+            with col2:
+                fake_ct_img = postprocess_tensor(result["fake_ct"])
+                st.image(fake_ct_img, caption="Synthetic CT", width=200)
+            
+            with col3:
+                if result.get("cycle_mri") is not None:
+                    cycle_img = postprocess_tensor(result["cycle_mri"])
+                    st.image(cycle_img, caption="Cycle MRI", width=200)
+                else:
+                    st.write("No cycle reconstruction")
+            
+            # Download synthetic CT
+            st.download_button(
+                label="📥 Download Synthetic CT (PNG)",
+                data=_bytes_from_pil(fake_ct_img),
+                file_name="synthetic_ct.png",
+                mime="image/png",
+                use_container_width=True
             )
-            inference_time = time.time() - start_time
+            
+        except Exception as e:
+            st.error(f"2D Inference failed: {str(e)}")
+
+
+def _handle_3d_inference(tmp_path: Path, checkpoint_path: Path):
+    """Handle 3D NIfTI volume inference workflow."""
+    try:
+        # Load and preview NIfTI
+        img = nib.load(str(tmp_path))
+        volume = img.get_fdata().astype(np.float32)
         
-        st.success(f"✅ Inference completed in {inference_time:.2f} seconds")
+        # Handle 4D by taking first volume
+        if volume.ndim == 4:
+            volume = volume[..., 0]
+            st.info("4D volume detected. Using first timepoint.")
         
-        # Save results to disk
-        with st.spinner("💾 Saving results..."):
-            save_inference_results(input_tensor, fake_ct, cycle_mri, RESULTS_DIR)
-            st.info(f"Results saved to: `{RESULTS_DIR}`")
+        shape = volume.shape
+        st.write(f"📊 **Volume shape**: {shape[0]} × {shape[1]} × {shape[2]}")
         
-        return input_tensor, fake_ct, cycle_mri
+        # Create previews
+        axial_img, coronal_img, sagittal_img, (z_mid, y_mid, x_mid) = _create_volume_previews(volume)
         
+        # Display previews
+        st.markdown("### 🔍 Volume Previews")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.image(axial_img, caption=f"Axial (slice {z_mid})", width=200)
+        with col2:
+            st.image(coronal_img, caption=f"Coronal (slice {y_mid})", width=200)
+        with col3:
+            st.image(sagittal_img, caption=f"Sagittal (slice {x_mid})", width=200)
+        
+        # NIfTI to PNG conversion
+        st.markdown("### 📤 Export Single Slice")
+        col_export1, col_export2 = st.columns(2)
+        
+        with col_export1:
+            if st.button("Export Middle Axial Slice", key="export_middle_axial_btn"):
+                st.image(axial_img, caption="Exported Axial PNG", width=250)
+                st.download_button(
+                    label="📥 Download Axial PNG",
+                    data=_bytes_from_pil(axial_img),
+                    file_name="axial_middle.png",
+                    mime="image/png",
+                    key="download_middle_axial_btn"
+                )
+        
+        with col_export2:
+            slice_idx = st.number_input(
+                "Select slice index", 
+                min_value=0, 
+                max_value=shape[2]-1, 
+                value=z_mid, 
+                step=1,
+                key="export_slice_idx_input"
+            )
+            if st.button("Export Selected Slice", key="export_selected_slice_btn"):
+                try:
+                    # Use robust slice extraction
+                    selected_img = extract_nifti_slice_as_png(tmp_path, int(slice_idx), axis=2)
+                    st.image(selected_img, caption=f"Slice {slice_idx}", width=250)
+                    st.download_button(
+                        label=f"📥 Download Slice {slice_idx}",
+                        data=_bytes_from_pil(selected_img),
+                        file_name=f"axial_{slice_idx:03d}.png",
+                        mime="image/png",
+                        key="download_selected_slice_btn"
+                    )
+                    
+                    # Store selected slice for potential sync with CT explorer
+                    st.session_state.selected_export_slice = int(slice_idx)
+                    
+                except Exception as e:
+                    st.error(f"Failed to extract slice {slice_idx}: {e}")
+        
+        # 3D volume inference
+        st.markdown("### 🧠 3D Volume Inference")
+        
+        # Initialize session state for inference results
+        if "inference_result" not in st.session_state:
+            st.session_state.inference_result = None
+        if "original_previews" not in st.session_state:
+            st.session_state.original_previews = None
+        
+        # Inference controls
+        col_inference1, col_inference2 = st.columns([2, 1])
+        
+        with col_inference1:
+            run_inference = st.button("🚀 Run 3D Volume Inference", type="primary", use_container_width=True)
+        
+        with col_inference2:
+            if st.button("🗑️ Clear Results", use_container_width=True):
+                st.session_state.inference_result = None
+                st.session_state.original_previews = None
+                st.rerun()
+        
+        if run_inference:
+            try:
+                # Progress tracking
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def progress_callback(current, total):
+                    progress = current / total
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing slice {current}/{total} ({progress:.1%})")
+                
+                with st.spinner("Running slice-by-slice MRI→CT inference..."):
+                    result = run_dual_mode_inference(
+                        tmp_path, 
+                        checkpoint_path, 
+                        do_cycle=False,
+                        progress_callback=progress_callback
+                    )
+                
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
+                
+                # Store results in session state
+                st.session_state.inference_result = result
+                st.session_state.original_previews = (axial_img, coronal_img, sagittal_img, (z_mid, y_mid, x_mid))
+                
+                st.success("✅ 3D inference completed!")
+                
+            except Exception as e:
+                st.error(f"3D Inference failed: {str(e)}")
+        
+        # Display results if available (persists across interactions)
+        if st.session_state.inference_result is not None:
+            result = st.session_state.inference_result
+            axial_img, coronal_img, sagittal_img, (z_mid, y_mid, x_mid) = st.session_state.original_previews
+            
+            st.write(f"📊 Output shape: {result['original_shape']}")
+            st.write(f"💾 Saved to: {result['output_path']}")
+            
+            # Display synthetic CT results with slice navigation
+            st.markdown("### 🔬 Synthetic CT Results")
+            
+            # Load the generated synthetic CT volume for visualization
+            try:
+                synthetic_ct_path = Path(result['output_path'])
+                
+                # Create preview slices from synthetic CT
+                synthetic_volume = result['fake_volume']
+                syn_axial, syn_coronal, syn_sagittal, (syn_z, syn_y, syn_x) = _create_volume_previews(synthetic_volume)
+                
+                # Show comparison: Original MRI vs Synthetic CT
+                st.markdown("#### 📊 Volume Comparison (Middle Slices)")
+                col_orig, col_synth = st.columns(2)
+                
+                with col_orig:
+                    st.markdown("**Original MRI**")
+                    st.image(axial_img, caption=f"MRI Axial (slice {z_mid})", width=250)
+                
+                with col_synth:
+                    st.markdown("**Synthetic CT**")
+                    st.image(syn_axial, caption=f"CT Axial (slice {syn_z})", width=250)
+                
+                # Interactive slice explorer for synthetic CT
+                st.markdown("#### 🎛️ Synthetic CT Slice Explorer")
+                explore_col1, explore_col2 = st.columns([1, 2])
+                
+                with explore_col1:
+                    # Slice selection controls (with session state keys for persistence)
+                    
+                    # Check if there's a selected export slice to sync with
+                    if hasattr(st.session_state, 'selected_export_slice'):
+                        export_slice = st.session_state.selected_export_slice
+                        st.info(f"💡 Last exported MRI slice: {export_slice}")
+                        if st.button("🔗 Jump CT Explorer to Same Slice", help=f"Set CT explorer to slice {export_slice}", key="sync_to_export_btn"):
+                            # Force update the slider by setting its session state value
+                            st.session_state.ct_slice_slider = min(export_slice, synthetic_volume.shape[2] - 1)
+                            st.rerun()
+                    
+                    ct_slice_idx = st.slider(
+                        "Select CT slice to view",
+                        min_value=0,
+                        max_value=synthetic_volume.shape[2] - 1,
+                        value=syn_z,
+                        help="Navigate through synthetic CT volume",
+                        key="ct_slice_slider"
+                    )
+                    
+                    # View orientation (with session state key)
+                    ct_orientation = st.selectbox(
+                        "View orientation",
+                        ["Axial", "Coronal", "Sagittal"],
+                        index=0,
+                        key="ct_orientation_select"
+                    )
+                    
+                    # Export current slice
+                    if st.button("📤 Export Current Slice", use_container_width=True, key="export_slice_btn"):
+                        try:
+                            # Extract slice based on orientation
+                            if ct_orientation == "Axial":
+                                axis = 2
+                            elif ct_orientation == "Coronal":
+                                axis = 1
+                            else:  # Sagittal
+                                axis = 0
+                            
+                            # Use robust extraction from synthetic CT
+                            current_slice_img = extract_nifti_slice_as_png(
+                                synthetic_ct_path, ct_slice_idx, axis
+                            )
+                            
+                            st.download_button(
+                                label=f"📥 Download {ct_orientation} Slice {ct_slice_idx}",
+                                data=_bytes_from_pil(current_slice_img),
+                                file_name=f"synthetic_ct_{ct_orientation.lower()}_{ct_slice_idx:03d}.png",
+                                mime="image/png",
+                                use_container_width=True,
+                                key="download_slice_btn"
+                            )
+                        except Exception as e:
+                            st.error(f"Failed to export slice: {e}")
+                
+                with explore_col2:
+                    # Display selected slice
+                    try:
+                        if ct_orientation == "Axial":
+                            axis = 2
+                        elif ct_orientation == "Coronal":
+                            axis = 1
+                        else:  # Sagittal
+                            axis = 0
+                        
+                        # Extract and display current slice
+                        current_slice_img = extract_nifti_slice_as_png(
+                            synthetic_ct_path, ct_slice_idx, axis
+                        )
+                        
+                        st.image(
+                            current_slice_img,
+                            caption=f"Synthetic CT - {ct_orientation} View (Slice {ct_slice_idx})",
+                            width=400
+                        )
+                        
+                        # Show slice statistics
+                        slice_data = np.array(current_slice_img)
+                        st.write(f"📈 Intensity range: {slice_data.min()}-{slice_data.max()}")
+                        st.write(f"📐 Dimensions: {slice_data.shape[0]}×{slice_data.shape[1]}")
+                        
+                    except Exception as e:
+                        st.error(f"Failed to display slice {ct_slice_idx}: {e}")
+            
+            except Exception as e:
+                st.error(f"Failed to load synthetic CT for visualization: {e}")
+            
+            # Download synthetic CT volume
+            with open(result['output_path'], 'rb') as f:
+                st.download_button(
+                    label="📥 Download Complete Synthetic CT Volume (NIfTI)",
+                    data=f.read(),
+                    file_name="synthetic_ct_volume.nii.gz",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                    key="download_volume_btn"
+                )
+                
     except Exception as e:
-        st.error(f"❌ Inference failed: {str(e)}")
-        st.exception(e)  # Show full traceback in debug mode
-        return None
+        st.error(f"Failed to process NIfTI file: {str(e)}")
 
 
 def main():
-    """Main application logic."""
-    setup_page()
+    """Main application."""
+    _setup_page()
     
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # System status
-        st.subheader("System Status")
-        if not check_requirements():
-            st.stop()
-        
-        # Model info
-        st.subheader("Model Information")
-        st.info(f"""
-        **Checkpoint:** step_008000.pt  
-        **Architecture:** ResNet Generator (9 blocks)  
-        **Input/Output:** 256×256 grayscale  
-        **Training:** CycleGAN on CHAOS dataset
-        """)
-        
-        # Advanced options
-        st.subheader("Advanced Options")
-        
-        force_cpu = st.checkbox("Force CPU inference", value=False)
-        if force_cpu:
-            st.warning("⚠️ CPU inference will be significantly slower")
+    # Sidebar
+    checkpoint_path, do_cycle = _render_sidebar(CHECKPOINT_PATH)
     
-    # Main interface
-    st.markdown("## 📁 Section A: Upload MRI Image")
-    
-    uploaded_file = st.file_uploader(
-        "Choose an MRI image file",
-        type=['png', 'jpg', 'jpeg', 'nii', 'gz'],
-        help="Supported formats: PNG, JPG, JPEG, NIfTI (.nii, .nii.gz)"
+    # File uploader
+    st.markdown("## 📁 Upload Medical Image")
+    uploaded = st.file_uploader(
+        "Choose MRI file",
+        type=["png", "jpg", "jpeg", "nii", "gz"],
+        help="PNG/JPG for 2D slices, NIfTI (.nii/.nii.gz) for 3D volumes"
     )
     
-    if uploaded_file is not None:
-        # Process uploaded file
-        result = process_uploaded_file(uploaded_file)
-        if result is None:
-            st.stop()
-            
-        image, file_info, slice_idx = result
+    if uploaded is not None:
+        file_ext = Path(uploaded.name).suffix.lower()
         
-        # Display file info and preview
-        col1, col2 = st.columns([1, 2])
+        if file_ext in SUPPORTED_IMAGE_EXTS:
+            # 2D workflow
+            st.markdown("## 📷 2D Slice Processing")
+            try:
+                pil_img = Image.open(uploaded).convert("L")
+                _handle_2d_inference(pil_img, checkpoint_path, do_cycle)
+            except Exception as e:
+                st.error(f"Failed to process 2D image: {str(e)}")
         
-        with col1:
-            st.markdown(file_info)
-            if slice_idx is not None:
-                st.info(f"Using middle slice: {slice_idx}")
-            
-        with col2:
-            st.image(image, caption="Uploaded MRI Preview", width=300)
+        elif uploaded.name.lower().endswith((".nii", ".nii.gz")):
+            # 3D workflow
+            st.markdown("## 🧠 3D Volume Processing")
+            try:
+                # Save uploaded NIfTI to temp file
+                tmp_path = Path(tempfile.gettempdir()) / f"upload_{uploaded.name.replace(' ', '_')}"
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded.read())
+                
+                _handle_3d_inference(tmp_path, checkpoint_path)
+                
+            except Exception as e:
+                st.error(f"Failed to process 3D volume: {str(e)}")
         
-        # Section B: Run inference
-        st.markdown("## 🚀 Section B: Generate Synthetic CT")
-        
-        if st.button("🧠 Generate CT Scan", type="primary", use_container_width=True):
-            
-            # Run inference pipeline
-            results = run_inference_pipeline(image)
-            
-            if results is not None:
-                input_tensor, fake_ct, cycle_mri = results
-                
-                # Section C: Display results
-                st.markdown("## 📊 Section C: Results Visualization")
-                pil_images = display_inference_results(input_tensor, fake_ct, cycle_mri)
-                
-                # Section D: Download options
-                st.markdown("## 📥 Section D: Download Results")
-                create_download_section(*pil_images)
-                
-                # Additional metrics/info
-                st.markdown("### 📈 Additional Information")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Input Resolution", f"{TARGET_SIZE}×{TARGET_SIZE}")
-                
-                with col2:
-                    device = get_device(force_cpu)
-                    st.metric("Inference Device", device.type.upper())
-                
-                with col3:
-                    st.metric("Model Type", "CycleGAN")
+        else:
+            st.error("❌ Unsupported file format. Use PNG/JPG for 2D or NIfTI for 3D.")
     
     else:
-        # Show example/instructions when no file uploaded
+        # Instructions
         st.info("""
-        👆 **Upload an MRI image to get started!**
+        👆 **Upload a medical image to get started**
         
         **Supported formats:**
-        - Standard images: PNG, JPG, JPEG
-        - Medical images: NIfTI (.nii, .nii.gz)
+        - 🖼️ **2D images**: PNG, JPG, JPEG (single MRI slices)
+        - 🧠 **3D volumes**: NIfTI (.nii, .nii.gz) (full MRI volumes)
         
-        **What happens next:**
-        1. Your MRI will be preprocessed to 256×256 resolution
-        2. The CycleGAN model generates a synthetic CT scan
-        3. Cycle consistency shows reconstruction quality
-        4. Download all results as PNG files
+        **What this app does:**
+        - Converts MRI images to synthetic CT images using CycleGAN
+        - Preserves medical image metadata and spatial information
+        - Provides download options for results
         """)
-        
-        # Show model architecture info
-        with st.expander("🏗️ Model Architecture Details"):
-            st.markdown("""
-            **CycleGAN Architecture:**
-            - **Generator:** ResNet-based with 9 residual blocks
-            - **Discriminator:** PatchGAN (70×70 receptive field)
-            - **Training:** Unpaired MRI↔CT translation
-            - **Losses:** Adversarial + Cycle consistency + Identity
-            
-            **Key Features:**
-            - No paired training data required
-            - Preserves anatomical structure
-            - Bidirectional translation capability
-            - Instance normalization for stable training
-            """)
 
 
 if __name__ == "__main__":

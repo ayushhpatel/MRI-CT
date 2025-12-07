@@ -8,3 +8,4 @@ data/processed/
 *.pth
 *.pt
 downloads/
+data/chaos_3k/

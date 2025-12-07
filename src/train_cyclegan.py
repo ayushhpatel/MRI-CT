@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn as nn
@@ -13,9 +17,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from torchvision import transforms
 import yaml
 
-from .datasets import UnpairedImageDataset
-from .models import NLayerDiscriminator, ResnetGenerator, init_weights
-from .utils import get_device, save_sample_grid
+from src.datasets import UnpairedImageDataset
+from src.models import NLayerDiscriminator, ResnetGenerator, init_weights
+from src.utils import get_device, save_sample_grid
 
 
 class ReplayBuffer:
