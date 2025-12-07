@@ -7,3 +7,4 @@ data/chaos/
 data/processed/
 *.pth
 *.pt
+downloads/
