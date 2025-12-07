@@ -1,0 +1,30 @@
+FINAL CYCLEGAN EVALUATION REPORT
+==================================================
+Checkpoint: step_008000.pt
+Evaluation Date: 2025-12-07 00:27:18
+Total Samples: 200
+
+📊 OVERALL PERFORMANCE
+------------------------------
+Mean SSIM: 0.8962 ± 0.0457
+Mean PSNR: 29.19 ± 2.24 dB
+
+🔄 MRI CYCLE (MRI → CT → MRI)
+------------------------------
+Mean SSIM: 0.9247 ± 0.0273
+Mean PSNR: 30.09 ± 2.31 dB
+Mean MSE: 0.001140 ± 0.000692
+Mean MAE: 0.016052 ± 0.004791
+
+🔄 CT CYCLE (CT → MRI → CT)
+------------------------------
+Mean SSIM: 0.8677 ± 0.0425
+Mean PSNR: 28.30 ± 1.76 dB
+Mean MSE: 0.001668 ± 0.001375
+Mean MAE: 0.022978 ± 0.008883
+
+🎯 PERFORMANCE ANALYSIS
+------------------------------
+✅ Excellent structural similarity (SSIM > 0.8)
+✅ High image quality (PSNR > 25 dB)
+⚠️  Unbalanced performance - MRI cycle performs better
